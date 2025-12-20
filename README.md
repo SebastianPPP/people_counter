@@ -1,31 +1,54 @@
-# Computer Vision: Intelligent People Counter
+# Computer Vision: People counter project
 
-This project implements an advanced computer vision system for monitoring and analyzing pedestrian movement within a defined Region of Interest (ROI) captured by a static camera.
+This project implements an advanced computer vision system for monitoring and analyzing pedestrian movement within a defined Region of Interest (ROI). It balances high analytical precision with performance optimization, designed to run smoothly on standard CPU hardware.
 
-## Project goal 
+## Project goal
 
-### Core requirements 
+### Core requirements
 * **Unique Person Counting:** Accurately count non-repeating individuals who cross a defined counting line/region.
+* **Real-Time Performance:** Maintain fluid video playback and processing speed on consumer-grade hardware (Intel Core i3/i5) without dedicated GPUs.
 
-### Implementation level 
-* **Low-Level Implementation:** Achieved through custom tracking logic (managing track history and IDs) and utilization of optimized, low-level linear algebra libraries (BLAS/LAPACK) via **NumPy** and **PyTorch** for feature distance calculation and model inference.
+### Implementation level
+* **Low-Level Implementation:** Achieved through custom tracking logic (IoU matching, motion vectors) and **Pure Math** image processing (NumPy-based mask erosion) instead of heavy external libraries.
 
 ---
 
-## Application features (some are not yet fully implemented)
+## Application features
 
-The application includes an improved tracking system and lays the foundation for advanced statistical extensions ($T_b$).
+### 1. Interface & Monitoring
+The application features a modern GUI with real-time analytics, system monitoring, and collapsible control panels.
 
-### 1. Advanced tracking & counting
+![Application Interface](img/app.png)
+*Figure 1: Main application window showing active tracking, segmentation, and control panel.*
 
-* **YOLOv8 Detection:** Uses the powerful YOLOv8 model for real-time person detection.
-* **Unique Pass Counting:** Implements **pass-through logic** based on track history to count a person only once when they traverse the defined central region.
-* **Occlusion Resistance:** Achieved through stable object tracking combined with custom history management to minimize ID swapping during brief occlusions.
+### 2. Advanced tracking & counting
+* **Dual Detection Modes:**
+    * **Standard Mode:** Uses `yolov8n` (bounding boxes) for maximum speed.
+    * **Segmentation Mode:** Uses `yolov8n-seg` for precise pixel-level analysis.
+* **Unique Pass Counting:** Implements logic to count a person only once when they traverse the central zone.
+* **Occlusion Resistance:** Uses trajectory prediction to maintain IDs during brief obstructions.
 
-### 2. Statistical analysis
+### 3. Statistical analysis
+The application calculates real-time metrics for tracked individuals:
+* **Average Speed (px/s):** Estimates movement speed based on frame displacement.
+* **Dwell Time:** Measures how long individuals stay within the ROI.
+* **Smart Color Detection ("First Sight Lock"):** Identifies clothing color using semantic segmentation. It analyzes the color **only once** (upon first reliable detection) and locks the result to save CPU resources.
 
-The application displays and calculates the following statistics in real-time, focusing on tracks within the central region:
+### 4. Performance Engineering
+* **Pure Math Processing:** Replaces OpenCV morphological operations with raw **NumPy** matrix manipulations for mask erosion.
+* **OpenVINO™ Integration:** Built-in optimizer to boost inference speed on Intel CPUs.
+* **Real-Time Sync:** Automatically adjusts processing intervals (sleep/skip) to match the video's native framerate (e.g., 25 FPS).
 
-* **Average Speed (px/s):** Calculates the average speed of movement based on positional changes between frames and the video's FPS.
-* **Average Time in Region (s):** Calculates the average duration (in seconds) that counted individuals spend inside the central region.
-* **Clothing Color Estimation:** Estimates the dominant BGR color of the upper body (clothing) for visualization, demonstrating semantic segmentation capability.
+![Performance Graph](img/fps.png)
+*Figure 2: Post-session performance report showing FPS stability over time.*
+
+## How to Run
+
+1.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+2.  **Run the application:**
+    ```bash
+    python tracker_v2.py
+    ```

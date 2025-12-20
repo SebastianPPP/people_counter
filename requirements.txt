@@ -1,0 +1,7 @@
+opencv-python
+ultralytics
+psutil
+matplotlib
+Pillow
+numpy
+openvino # it depends on specific version of python and OS, so install it manually if needed

@@ -11,10 +11,12 @@ import psutil
 import torch
 import os
 
+# Biblioteki do wykresów
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+# --- 1. TRACKER (Math only) ---
 class LowLevelTracker:
     def __init__(self, max_lost=30, iou_thresh=0.3):
         self.max_lost = max_lost
@@ -149,22 +151,63 @@ class LowLevelTracker:
                     break
         return active_tracks_map, lost_ids, track_id_to_det_index
 
+# --- 2. ADVANCED COLOR LOGIC (PURE NUMPY) ---
+
+def numpy_erode(mask, iterations=1):
+    """
+    Ręczna implementacja erozji (odchudzania maski) używająca tylko NumPy.
+    Symuluje erozję elementem 3x3 poprzez przesunięcia bitowe.
+    """
+    if iterations <= 0: return mask
+    
+    # Konwersja na bool dla szybkości operacji logicznych
+    m = mask.astype(bool)
+    
+    # Aby zasymulować "zjedzenie" krawędzi o 1 piksel, 
+    # piksel musi być 1 ORAZ wszyscy jego sąsiedzi muszą być 1.
+    # Robimy to przesuwając obraz w 4 strony i biorąc część wspólną (AND).
+    
+    for _ in range(iterations):
+        # Shift Up
+        up = np.zeros_like(m)
+        up[:-1, :] = m[1:, :]
+        
+        # Shift Down
+        down = np.zeros_like(m)
+        down[1:, :] = m[:-1, :]
+        
+        # Shift Left
+        left = np.zeros_like(m)
+        left[:, :-1] = m[:, 1:]
+        
+        # Shift Right
+        right = np.zeros_like(m)
+        right[:, 1:] = m[:, :-1]
+        
+        # Część wspólna wszystkich przesunięć
+        m = m & up & down & left & right
+
+    return m.astype(np.uint8)
+
 def get_color_histogram_method(img, mask, box):
     x1, y1, x2, y2 = box
     h, w = img.shape[:2]
+    # Clip coordinates
     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
     
     roi_img = img[y1:y2, x1:x2]
     roi_h, roi_w = roi_img.shape[:2]
     if roi_h < 5 or roi_w < 5: return None, None
     
+    # Resize maski - tutaj używamy cv2.resize, bo to najwydajniejsza interpolacja
     mask_resized = cv2.resize(mask, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
     mask_bin = (mask_resized > 0.5).astype(np.uint8)
 
+    # [ZMIANA] Użycie własnej funkcji NumPy zamiast cv2.erode
     iterations = 1 if roi_w > 50 else 0
-    kernel = np.ones((3,3), np.uint8)
-    mask_eroded = cv2.erode(mask_bin, kernel, iterations=iterations)
+    mask_eroded = numpy_erode(mask_bin, iterations=iterations)
 
+    # Strict Center Crop & Width Adjustment
     center_y = int(roi_h * 0.35) 
     center_x = int(roi_w * 0.5)
     crop_h = int(roi_h * 0.25)
@@ -179,11 +222,15 @@ def get_color_histogram_method(img, mask, box):
     mask_crop = mask_eroded[y_start:y_end, x_start:x_end]
 
     valid_pixels = img_crop[mask_crop > 0]
+    
+    # Fallback: jeśli erozja zjadła wszystko
     if len(valid_pixels) < 10:
         mask_crop = mask_bin[y_start:y_end, x_start:x_end]
         valid_pixels = img_crop[mask_crop > 0]
+        
     if len(valid_pixels) < 10: return "Unknown", None 
 
+    # Histogram HSV
     valid_pixels_2d = valid_pixels.reshape(-1, 1, 3)
     hsv_pixels = cv2.cvtColor(valid_pixels_2d, cv2.COLOR_BGR2HSV)
     
@@ -194,6 +241,7 @@ def get_color_histogram_method(img, mask, box):
     scores = defaultdict(int)
     total = len(H)
     
+    # Progi kolorów
     is_black = (V < 35) 
     scores['Black'] = np.sum(is_black)
     is_white = (V > 200) & (S < 40)
@@ -219,10 +267,11 @@ def get_color_histogram_method(img, mask, box):
         return "Unknown", debug_rect
     return best_color, debug_rect
 
+# --- 3. GUI APPLICATION ---
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("People Tracker")
+        self.root.title("People Analytics - Ultimate")
         self.root.geometry("1200x950")
         self.root.config(bg="#121212")
 
@@ -274,9 +323,9 @@ class App:
         self.var_mode = tk.StringVar(value="seg") 
         
         self.control_visible = True
+        self.perf_section_visible = False 
         self.ext_stats_visible = False
-        self.perf_settings_visible = False 
-        self.sys_stats_visible = True #
+        self.sys_stats_visible = True 
 
         self.setup_ui()
         self.reload_model_based_on_mode()
@@ -291,10 +340,12 @@ class App:
         self.lbl_vid = tk.Label(self.vid_frame, bg="black", text="Load Video to Start", fg="gray")
         self.lbl_vid.pack(expand=True, fill="both")
 
+        # Side Panel
         side_panel = tk.Frame(main_frame, bg="#1e1e1e", width=320)
         side_panel.grid(row=0, column=1, sticky="ns", padx=5)
         side_panel.pack_propagate(False)
 
+        # === A. CONTROL PANEL ===
         ctrl_header = tk.Frame(side_panel, bg="#1e1e1e")
         ctrl_header.pack(fill="x", padx=10, pady=(10,5))
         self.btn_toggle_ctrl = tk.Button(ctrl_header, text="▼", font=("Consolas", 10), bg="#1e1e1e", fg="white", bd=0, command=self.toggle_control_panel, cursor="hand2")
@@ -328,6 +379,7 @@ class App:
         ttk.Radiobutton(mode_frame, text="Standard (Fast, Box Only)", value="box", variable=self.var_mode, command=self.on_mode_change).pack(anchor="w")
         ttk.Radiobutton(mode_frame, text="Segmentation (Color, Slow)", value="seg", variable=self.var_mode, command=self.on_mode_change).pack(anchor="w")
 
+        # === B. Basic Stats ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         self.stats_container = tk.Frame(side_panel, bg="#2d2d2d", padx=10, pady=10)
         self.stats_container.pack(fill="x", padx=10)
@@ -335,6 +387,7 @@ class App:
         self.lbl_count.pack()
         tk.Label(self.stats_container, text="People Passed", bg="#2d2d2d", fg="#aaaaaa", font=("Segoe UI", 9)).pack()
 
+        # === C. Extended Stats ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         ext_header = tk.Frame(side_panel, bg="#1e1e1e")
         ext_header.pack(fill="x", padx=10, pady=5)
@@ -351,6 +404,7 @@ class App:
         self.lbl_colors = tk.Label(self.ext_content_frame, text="-", bg="#252525", fg="white", font=("Consolas", 9), justify="left")
         self.lbl_colors.pack(anchor="w")
 
+        # === D. Settings ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         perf_header_frame = tk.Frame(side_panel, bg="#1e1e1e")
         perf_header_frame.pack(fill="x", padx=10, pady=5)
@@ -367,6 +421,7 @@ class App:
                                    bg="#1e1e1e", fg="white", highlightthickness=0, command=self.update_params)
         self.scale_skip.pack(fill="x", padx=10, pady=(10,0))
         
+        # === E. System Monitor ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         sys_header = tk.Frame(side_panel, bg="#1e1e1e")
         sys_header.pack(fill="x", padx=10, pady=5)
@@ -384,6 +439,7 @@ class App:
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(0, weight=1)
 
+    # --- TOGGLES ---
     def toggle_control_panel(self):
         if self.control_visible:
             self.control_content_frame.pack_forget()
@@ -405,14 +461,14 @@ class App:
             self.ext_stats_visible = True
 
     def toggle_perf_section(self):
-        if self.perf_settings_visible:
+        if self.perf_section_visible:
             self.perf_content_frame.pack_forget()
             self.btn_toggle_perf.config(text="▶")
-            self.perf_settings_visible = False
+            self.perf_section_visible = False
         else:
             self.perf_content_frame.pack(fill="x", pady=5, after=self.btn_toggle_perf.master)
             self.btn_toggle_perf.config(text="▼")
-            self.perf_settings_visible = True
+            self.perf_section_visible = True
 
     def toggle_sys_stats(self):
         if self.sys_stats_visible:
@@ -424,6 +480,7 @@ class App:
             self.btn_toggle_sys.config(text="▼")
             self.sys_stats_visible = True
 
+    # --- LOGIC ---
     def reload_model_based_on_mode(self):
         mode = self.var_mode.get()
         try:
@@ -614,6 +671,7 @@ class App:
             else:
                 tracks = self.tracker.get_interpolated_tracks()
 
+            # Archive closed
             for tid in lost_ids:
                 if tid in self.track_metadata:
                     meta = self.track_metadata[tid]
@@ -625,6 +683,7 @@ class App:
                         })
                     del self.track_metadata[tid]
 
+            # Active
             rx, ry, rw, rh = self.zone_rel
             zx1, zx2 = int((rx)*w), int((rx+rw)*w)
             cv2.rectangle(process_frame, (zx1, 0), (zx2, h), (255, 200, 0), 2)
@@ -652,6 +711,7 @@ class App:
                             self.seen_ids.add(tid)
                             self.passed += 1
 
+                # KOLOR
                 if is_seg_mode and should_detect:
                     is_color_missing = (meta.get('final_color') in [None, "Unknown"])
                     should_check_color = (masks is not None) and (tid in id_to_det_idx) and is_color_missing
@@ -678,6 +738,7 @@ class App:
                                         self.saved_examples_count += 1
                                     except: pass
 
+                # Rysowanie
                 col = (0, 255, 0) if inside else (0, 0, 255)
                 thick = 2 if should_detect else 1
                 cv2.rectangle(process_frame, (box[0], box[1]), (box[2], box[3]), col, thick)
@@ -686,6 +747,7 @@ class App:
                     label += f" [{meta['final_color']}]"
                 cv2.putText(process_frame, label, (box[0], box[1]-5), 0, 0.5, col, thick)
 
+            # Update FPS/Time
             t_end = time.time()
             fps_real = 1000/((t_end-t_start)*1000 + 1e-6)
             current_duration = t_end - self.start_time_ref
@@ -707,6 +769,7 @@ class App:
             self.root.after(0, upd)
             
             frame_idx += 1
+            # Sync
             elapsed = time.time() - t_start
             wait = frame_dur - elapsed
             if wait > 0: time.sleep(wait)
