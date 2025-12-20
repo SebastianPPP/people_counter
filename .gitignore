@@ -1,1 +1,4 @@
-test_videos
+debug_histogram
+debug_captures
+yolov8n_openvino_model
+yolov8n-seg_openvino_model
