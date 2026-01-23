@@ -10,6 +10,7 @@ import time
 import psutil
 import torch
 import os
+from bench_tools import AnalyticsEngine 
 
 # Biblioteki do wykresów
 import matplotlib.pyplot as plt
@@ -154,94 +155,73 @@ class LowLevelTracker:
 # --- 2. ADVANCED COLOR LOGIC (PURE NUMPY) ---
 
 def numpy_erode(mask, iterations=1):
-    """
-    Ręczna implementacja erozji (odchudzania maski) używająca tylko NumPy.
-    Symuluje erozję elementem 3x3 poprzez przesunięcia bitowe.
-    """
     if iterations <= 0: return mask
     
-    # Konwersja na bool dla szybkości operacji logicznych
+    # Kopiujemy tylko raz na początku
     m = mask.astype(bool)
     
-    # Aby zasymulować "zjedzenie" krawędzi o 1 piksel, 
-    # piksel musi być 1 ORAZ wszyscy jego sąsiedzi muszą być 1.
-    # Robimy to przesuwając obraz w 4 strony i biorąc część wspólną (AND).
-    
     for _ in range(iterations):
-        # Shift Up
-        up = np.zeros_like(m)
-        up[:-1, :] = m[1:, :]
+        # Używamy logicznego AND bezpośrednio na wycinkach (slices)
+        # To nie tworzy nowych macierzy 'up', 'down' itd.
+        m[1:-1, 1:-1] &= m[0:-2, 1:-1] # Góra
+        m[1:-1, 1:-1] &= m[2:, 1:-1]   # Dół
+        m[1:-1, 1:-1] &= m[1:-1, 0:-2] # Lewo
+        m[1:-1, 1:-1] &= m[1:-1, 2:]   # Prawo
         
-        # Shift Down
-        down = np.zeros_like(m)
-        down[1:, :] = m[:-1, :]
+        # Brzegi maski zazwyczaj zerujemy, bo nie mają kompletu sąsiadów
+        m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = False
         
-        # Shift Left
-        left = np.zeros_like(m)
-        left[:, :-1] = m[:, 1:]
-        
-        # Shift Right
-        right = np.zeros_like(m)
-        right[:, 1:] = m[:, :-1]
-        
-        # Część wspólna wszystkich przesunięć
-        m = m & up & down & left & right
-
     return m.astype(np.uint8)
 
 def get_color_histogram_method(img, mask, box):
-    x1, y1, x2, y2 = box
+    # NAPRAWA: Rzutowanie współrzędnych na int, aby uniknąć błędu 'slice indices must be integers'
+    x1, y1, x2, y2 = map(int, box) 
     h, w = img.shape[:2]
-    # Clip coordinates
+    
+    # Clip coordinates do granic obrazu
     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
     
     roi_img = img[y1:y2, x1:x2]
     roi_h, roi_w = roi_img.shape[:2]
     if roi_h < 5 or roi_w < 5: return None, None
     
-    # Resize maski - tutaj używamy cv2.resize, bo to najwydajniejsza interpolacja
+    # Resize maski do rozmiaru ROI
     mask_resized = cv2.resize(mask, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
     mask_bin = (mask_resized > 0.5).astype(np.uint8)
 
-    # [ZMIANA] Użycie własnej funkcji NumPy zamiast cv2.erode
-    iterations = 1 if roi_w > 50 else 0
+    # OPTYMALIZACJA: Dynamiczna liczba iteracji erozji zależna od wielkości obiektu
+    # Poprawia stabilność wyników Re-ID (Ablation Study)
+    mask_area = np.sum(mask_bin)
+    iterations = max(1, int(mask_area / 5000)) if roi_w > 40 else 0
     mask_eroded = numpy_erode(mask_bin, iterations=iterations)
 
-    # Strict Center Crop & Width Adjustment
-    center_y = int(roi_h * 0.35) 
-    center_x = int(roi_w * 0.5)
-    crop_h = int(roi_h * 0.25)
-    crop_w = int(roi_w * 0.60) 
+    # Center Crop dla analizy głównego koloru (np. tułowia)
+    center_y, center_x = int(roi_h * 0.35), int(roi_w * 0.5)
+    crop_h, crop_w = int(roi_h * 0.25), int(roi_w * 0.60) 
     
-    y_start = max(0, center_y - crop_h // 2)
-    y_end = min(roi_h, center_y + crop_h // 2)
-    x_start = max(0, center_x - crop_w // 2)
-    x_end = min(roi_w, center_x + crop_w // 2)
+    y_start, y_end = max(0, center_y - crop_h // 2), min(roi_h, center_y + crop_h // 2)
+    x_start, x_end = max(0, center_x - crop_w // 2), min(roi_w, center_x + crop_w // 2)
 
     img_crop = roi_img[y_start:y_end, x_start:x_end]
     mask_crop = mask_eroded[y_start:y_end, x_start:x_end]
 
     valid_pixels = img_crop[mask_crop > 0]
     
-    # Fallback: jeśli erozja zjadła wszystko
+    # Fallback jeśli erozja była zbyt silna
     if len(valid_pixels) < 10:
         mask_crop = mask_bin[y_start:y_end, x_start:x_end]
         valid_pixels = img_crop[mask_crop > 0]
         
     if len(valid_pixels) < 10: return "Unknown", None 
 
-    # Histogram HSV
+    # Analiza HSV
     valid_pixels_2d = valid_pixels.reshape(-1, 1, 3)
     hsv_pixels = cv2.cvtColor(valid_pixels_2d, cv2.COLOR_BGR2HSV)
     
-    H = hsv_pixels[:,:,0].flatten()
-    S = hsv_pixels[:,:,1].flatten()
-    V = hsv_pixels[:,:,2].flatten()
-
+    H, S, V = hsv_pixels[:,:,0].flatten(), hsv_pixels[:,:,1].flatten(), hsv_pixels[:,:,2].flatten()
     scores = defaultdict(int)
-    total = len(H)
     
-    # Progi kolorów
+    # Logika progowania kolorów
     is_black = (V < 35) 
     scores['Black'] = np.sum(is_black)
     is_white = (V > 200) & (S < 40)
@@ -260,12 +240,9 @@ def get_color_histogram_method(img, mask, box):
         scores['Purple'] = np.sum((H_color >= 135) & (H_color < 170))
 
     best_color = max(scores, key=scores.get)
-    best_score = scores[best_color]
-    debug_rect = (x_start, y_start, x_end-x_start, y_end-y_start)
-
-    if best_score < total * 0.15:
-        return "Unknown", debug_rect
-    return best_color, debug_rect
+    if scores[best_color] < len(H) * 0.15: return "Unknown", None
+    
+    return best_color, (x_start, y_start, x_end-x_start, y_end-y_start)
 
 # --- 3. GUI APPLICATION ---
 class App:
@@ -274,6 +251,12 @@ class App:
         self.root.title("People Analytics - Ultimate")
         self.root.geometry("1200x950")
         self.root.config(bg="#121212")
+
+        try:
+            self.bench = AnalyticsEngine()
+            print(">>> DEBUG: AnalyticsEngine zainicjalizowany poprawnie")
+        except Exception as e:
+            print(f">>> DEBUG ERROR: Nie udało się stworzyć AnalyticsEngine: {e}")
 
         style = ttk.Style()
         style.theme_use('clam')
@@ -562,6 +545,7 @@ class App:
 
     def stop(self): 
         self.play = False
+        self.bench.save_report() # Zapisz CSV
         self.root.after(500, self.show_fps_chart)
     
     def show_fps_chart(self):
@@ -636,20 +620,30 @@ class App:
     def loop(self):
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         frame_dur = 1.0 / fps
-
         frame_idx = 0
+
         while self.play and self.cap.isOpened():
             if self.is_paused:
                 time.sleep(0.1)
                 continue
 
-            t_start = time.time()
+            # --- START PROFILOWANIA KLATKI ---
+            self.bench.reset_timer()
+            t_frame_start = time.time()
+            
+            # 1. Odczyt klatki
             ret, frame = self.cap.read()
             if not ret: break
             if self.path == 0: frame = cv2.flip(frame, 1)
-
+            t_read = self.bench.get_elapsed()
+            
+            # 2. Preprocessing
+            self.bench.reset_timer()
             process_frame = cv2.resize(frame, (640, 360)) 
             h, w = process_frame.shape[:2]
+            t_preprocess = self.bench.get_elapsed()
+            
+            steps = {'read': t_read, 'preprocess': t_preprocess}
             
             tracks = {}
             active_map = {}
@@ -661,17 +655,26 @@ class App:
             is_seg_mode = (self.var_mode.get() == "seg")
 
             if should_detect:
+                # 3. Inferencja YOLO
+                self.bench.reset_timer()
+                # imgsz przekazywany dynamicznie naprawia błędy OpenVINO
                 results = self.model.predict(process_frame, verbose=False, imgsz=self.current_imgsz, device=self.device)[0]
+                steps['inference'] = self.bench.get_elapsed()
+                
+                # 4. Logika Trackera
+                self.bench.reset_timer()
+                # Rzutowanie na int zapobiega błędom indeksowania macierzy
                 dets = [tuple(b.xyxy[0].cpu().numpy().astype(int)) for b in results.boxes if int(b.cls[0]) == 0]
                 if is_seg_mode and results.masks is not None:
                     masks = results.masks.data.cpu().numpy() 
                 
                 active_map, lost_ids, id_to_det_idx = self.tracker.update(dets, (w, h))
                 tracks = active_map 
+                steps['tracking'] = self.bench.get_elapsed()
             else:
                 tracks = self.tracker.get_interpolated_tracks()
 
-            # Archive closed
+            # Czyszczenie metadanych dla utraconych obiektów
             for tid in lost_ids:
                 if tid in self.track_metadata:
                     meta = self.track_metadata[tid]
@@ -683,21 +686,19 @@ class App:
                         })
                     del self.track_metadata[tid]
 
-            # Active
+            # Definicja strefy liczenia
             rx, ry, rw, rh = self.zone_rel
             zx1, zx2 = int((rx)*w), int((rx+rw)*w)
-            cv2.rectangle(process_frame, (zx1, 0), (zx2, h), (255, 200, 0), 2)
 
+            # --- GŁÓWNA PĘTLA ANALIZY I WIZUALIZACJI ---
             for tid, box in tracks.items():
                 if tid not in self.track_metadata:
-                    self.track_metadata[tid] = {
-                        'zone_duration': 0.0, 
-                        'zone_speeds': [], 
-                        'final_color': None 
-                    }
+                    self.track_metadata[tid] = {'zone_duration': 0.0, 'zone_speeds': [], 'final_color': None}
                 
                 meta = self.track_metadata[tid]
-                cx = (box[0] + box[2]) // 2
+                # Współrzędne całkowite do obliczeń i rysowania
+                bx1, by1, bx2, by2 = map(int, box)
+                cx = (bx1 + bx2) // 2
                 inside = zx1 <= cx <= zx2
 
                 if inside:
@@ -711,74 +712,76 @@ class App:
                             self.seen_ids.add(tid)
                             self.passed += 1
 
-                # KOLOR
+                # 5. KROK RE-ID (Analiza koloru na surowych pikselach)
                 if is_seg_mode and should_detect:
                     is_color_missing = (meta.get('final_color') in [None, "Unknown"])
-                    should_check_color = (masks is not None) and (tid in id_to_det_idx) and is_color_missing
-                    
-                    if should_check_color:
+                    if is_color_missing and (masks is not None) and (tid in id_to_det_idx):
+                        self.bench.reset_timer()
                         det_idx = id_to_det_idx[tid]
                         if det_idx < len(masks):
                             person_mask = masks[det_idx]
-                            raw_color, debug_rect = get_color_histogram_method(process_frame, person_mask, box)
                             
+                            # Pobranie koloru ZANIM narysujemy ramki na process_frame
+                            raw_color, _ = get_color_histogram_method(process_frame, person_mask, (bx1, by1, bx2, by2))
+                            
+                            steps['reid'] = steps.get('reid', 0) + self.bench.get_elapsed()
+
                             if raw_color:
                                 meta['final_color'] = raw_color
-                                # Debug save
-                                if self.saved_examples_count < 10 and tid not in self.saved_ids and raw_color != "Unknown" and debug_rect:
-                                    try:
-                                        x1, y1, x2, y2 = box
-                                        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-                                        crop_orig = process_frame[y1:y2, x1:x2].copy()
-                                        dx, dy, dw, dh = debug_rect
-                                        cv2.rectangle(crop_orig, (dx, dy), (dx+dw, dy+dh), (0,255,0), 1)
-                                        fname = f"{self.debug_folder}/id_{tid}_locked_{raw_color}.jpg"
-                                        cv2.imwrite(fname, crop_orig)
-                                        self.saved_ids.add(tid)
-                                        self.saved_examples_count += 1
-                                    except: pass
 
-                # Rysowanie
+                # 6. WIZUALIZACJA (Dopiero teraz rysujemy po obrazie)
                 col = (0, 255, 0) if inside else (0, 0, 255)
                 thick = 2 if should_detect else 1
-                cv2.rectangle(process_frame, (box[0], box[1]), (box[2], box[3]), col, thick)
+                
+                # Rysowanie ramki
+                cv2.rectangle(process_frame, (bx1, by1), (bx2, by2), col, thick)
+                
                 label = f"ID:{tid}"
-                if is_seg_mode and meta.get('final_color') and meta['final_color'] != "Unknown": 
+                if meta.get('final_color') and meta['final_color'] != "Unknown": 
                     label += f" [{meta['final_color']}]"
-                cv2.putText(process_frame, label, (box[0], box[1]-5), 0, 0.5, col, thick)
+                
+                cv2.putText(process_frame, label, (bx1, by1 - 5), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, thick)
 
-            # Update FPS/Time
-            t_end = time.time()
-            fps_real = 1000/((t_end-t_start)*1000 + 1e-6)
-            current_duration = t_end - self.start_time_ref
+            # Rysowanie linii strefy
+            cv2.rectangle(process_frame, (zx1, 0), (zx2, h), (255, 200, 0), 2)
+
+            # --- STATYSTYKI I WYŚWIETLANIE ---
+            t_frame_end = time.time()
+            fps_real = 1.0 / (t_frame_end - t_frame_start + 1e-6)
+            current_duration = t_frame_end - self.start_time_ref
+            
             self.fps_history.append(fps_real)
             self.time_history.append(current_duration)
 
+            mem = self.process.memory_info().rss / 1024**2
+            cpu = psutil.cpu_percent()
+            # Logowanie danych do AnalyticsEngine (potrzebne do raportu 1 i 2)
+            self.bench.log_frame(frame_idx, self.current_imgsz, self.is_openvino, steps, fps_real, cpu, mem)
+
             if frame_idx % 5 == 0:
                 self.root.after(0, self.update_ui_stats)
-                mem = self.process.memory_info().rss / 1024**2
                 self.root.after(0, self.update_perf_ui, fps_real, mem)
 
+            # Konwersja obrazu do Tkinter
             img_rgb = cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB)
             img_tk = ImageTk.PhotoImage(Image.fromarray(img_rgb))
             
-            def upd():
+            def upd(itk=img_tk):
                 if not self.play: return
-                self.lbl_vid.config(image=img_tk)
-                self.lbl_vid.image = img_tk
+                self.lbl_vid.config(image=itk)
+                self.lbl_vid.image = itk
             self.root.after(0, upd)
             
             frame_idx += 1
-            # Sync
-            elapsed = time.time() - t_start
+            # Synchronizacja FPS
+            elapsed = time.time() - t_frame_start
             wait = frame_dur - elapsed
             if wait > 0: time.sleep(wait)
 
         self.cap.release()
-        if not self.cap.isOpened() and self.play:
-             self.root.after(500, self.show_fps_chart)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    App(root)
+    app = App(root)
     root.mainloop()

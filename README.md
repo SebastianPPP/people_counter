@@ -48,6 +48,15 @@ The application calculates real-time metrics for tracked individuals:
     ```bash
     pip install -r requirements.txt
     ```
+    Note: `tkinter` is part of the Python standard library and is provided by your OS, not via `pip`. If you see "No matching distribution found for tkinter", install the OS package:
+    - Debian/Ubuntu: `sudo apt install python3-tk`
+    - Fedora: `sudo dnf install python3-tkinter`
+    - Arch Linux: `sudo pacman -S tk`
+
+    Optional verification after installation:
+    ```bash
+    python -c "import tkinter as tk; print('Tk version:', tk.TkVersion)"
+    ```
 2.  **Run the application:**
     ```bash
     python tracker_v2.py
