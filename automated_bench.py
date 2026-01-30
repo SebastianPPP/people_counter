@@ -1,209 +1,275 @@
 import cv2
-import time
-import pandas as pd
-import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import os
-from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
+from PIL import Image, ImageTk
 from ultralytics import YOLO
+import threading
+from collections import defaultdict, deque, Counter
+import time
 import psutil
+import torch
+import os
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
-# --- IMPORT TWOJEJ LOGIKI ---
-try:
-    from tracker_v2 import LowLevelTracker, numpy_erode, get_color_histogram_method
-    print(">>> Logic successfully imported.")
-except ImportError:
-    print(">>> ERROR: tracker_v2.py must be in the same directory!")
-    exit()
+matplotlib.use("Agg")
 
-class ScientificResearchSuite:
+
+def numpy_erode(mask, iterations=1):
+    if iterations <= 0: return mask
+    m = mask.astype(bool)
+    for _ in range(iterations):
+        m[1:-1, 1:-1] &= m[0:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, 0:-2] & m[1:-1, 2:]
+        m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = False
+    return m.astype(np.uint8)
+
+def get_color_histogram_method(img, mask, box):
+    try:
+        x1, y1, x2, y2 = map(int, box)
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        if x2-x1 < 5 or y2-y1 < 5: return "Unknown"
+        roi = img[y1:y2, x1:x2]
+        m_roi = cv2.resize(mask, (x2-x1, y2-y1), interpolation=cv2.INTER_NEAREST)
+        m_bin = (m_roi > 0.5).astype(np.uint8)
+        m_ero = numpy_erode(m_bin, iterations=1)
+        pixels = roi[m_ero > 0]
+        if len(pixels) < 10: pixels = roi[m_bin > 0]
+        if len(pixels) < 10: return "Unknown"
+        hsv = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV)
+        H, S, V = hsv[:,:,0].flatten(), hsv[:,:,1].flatten(), hsv[:,:,2].flatten()
+        scores = defaultdict(int)
+        scores['Black'] = np.sum(V < 35); scores['White'] = np.sum((V > 200) & (S < 40))
+        is_c = (V >= 35) & ~((V > 200) & (S < 40))
+        if np.sum(is_c) > 0:
+            Hc = H[is_c]
+            scores['Red'] = np.sum((Hc < 10) | (Hc > 170))
+            scores['Blue'] = np.sum((Hc >= 85) & (Hc < 135))
+        return max(scores, key=scores.get) if scores else "Unknown"
+    except: return "Unknown"
+
+class LowLevelTracker:
+    def __init__(self, max_lost=30, iou_thresh=0.3):
+        self.max_lost = max_lost
+        self.iou_thresh = iou_thresh
+        self.tracks = {} 
+        self.next_id = 1
+        self.pos_hist = defaultdict(lambda: deque(maxlen=30))
+
+    def calc_iou(self, boxesA, boxesB):
+        boxesA, boxesB = np.array(boxesA), np.array(boxesB)
+        if len(boxesA) == 0 or len(boxesB) == 0: return np.zeros((len(boxesA), len(boxesB)))
+        xA, yA = np.maximum(boxesA[:,None,0], boxesB[None,:,0]), np.maximum(boxesA[:,None,1], boxesB[None,:,1])
+        xB, yB = np.minimum(boxesA[:,None,2], boxesB[None,:,2]), np.minimum(boxesA[:,None,3], boxesB[None,:,3])
+        inter = np.maximum(0, xB-xA) * np.maximum(0, yB-yA)
+        areaA, areaB = (boxesA[:,2]-boxesA[:,0])*(boxesA[:,3]-boxesA[:,1]), (boxesB[:,2]-boxesB[:,0])*(boxesB[:,3]-boxesB[:,1])
+        return inter / (areaA[:,None] + areaB[None,:] - inter + 1e-6)
+
+    def update(self, dets, img_shape):
+        active_ids = [tid for tid, info in self.tracks.items() if info['status'] != 'lost']
+        preds = []
+        for tid in active_ids:
+            box, h = self.tracks[tid]['box'], self.pos_hist[tid]
+            dx, dy = (h[-1][0]-h[-2][0], h[-1][1]-h[-2][1]) if len(h) >= 2 else (0,0)
+            preds.append((box[0]+dx, box[1]+dy, box[2]+dx, box[3]+dy))
+        matches, unmatched_dets = [], set(range(len(dets)))
+        if len(dets) > 0 and len(preds) > 0:
+            iou_mat = self.calc_iou(dets, preds)
+            for d_idx, t_idx in np.argwhere(iou_mat > self.iou_thresh):
+                if d_idx in unmatched_dets:
+                    matches.append((d_idx, active_ids[t_idx]))
+                    unmatched_dets.remove(d_idx)
+        for d_idx, tid in matches:
+            box = dets[d_idx]
+            self.tracks[tid].update({'box': box, 'status': 'active', 'lost_cnt': 0})
+            self.pos_hist[tid].append(((box[0]+box[2])//2, (box[1]+box[3])//2))
+        for d_idx in unmatched_dets:
+            tid = self.next_id; self.next_id += 1
+            self.tracks[tid] = {'box': dets[d_idx], 'status': 'active', 'lost_cnt': 0}
+            self.pos_hist[tid].append(((dets[d_idx][0]+dets[d_idx][2])//2, (dets[d_idx][1]+dets[d_idx][3])//2))
+        return {tid: info['box'] for tid, info in self.tracks.items() if info['status'] == 'active'}
+
+class BenchmarkEngine:
+    def __init__(self, root_app):
+        self.app = root_app
+        init_data = lambda: {'inf': {}, 'trk': {}, 'res': {'imgsz': [], 'fps': [], 'reid': [], 'occ': [], 'gflops': []}}
+        self.results = {'cpu': init_data(), 'gpu': init_data()}
+
+    def run_suite(self, video_path):
+        devices = ['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']
+        resolutions = [160, 320, 480, 640]
+        model = YOLO("yolov8n-seg.pt")
+
+        for dev in devices:
+            key = 'gpu' if dev == 'cuda' else 'cpu'
+            self.app.update_status(f"Testing {key.upper()}...")
+            
+            for trk in ['Custom', 'bytetrack.yaml', 'botsort.yaml']:
+                cap = cv2.VideoCapture(video_path)
+                inf_l, trk_l = [], []
+                tracker = LowLevelTracker()
+                for _ in range(25):
+                    ret, frame = cap.read()
+                    if not ret: break
+                    frame = cv2.resize(frame, (640, 360))
+                    t0 = time.perf_counter()
+                    res = model.predict(frame, imgsz=320, device=dev, verbose=False)[0]
+                    inf_l.append((time.perf_counter()-t0)*1000)
+                    t1 = time.perf_counter()
+                    if trk == 'Custom':
+                        tracker.update([tuple(b.xyxy[0].cpu().numpy().astype(int)) for b in res.boxes], (640,360))
+                    else:
+                        model.track(frame, tracker=trk, imgsz=320, device=dev, verbose=False, persist=True)
+                    trk_l.append((time.perf_counter()-t1)*1000)
+                cap.release()
+                self.results[key]['inf'][trk] = np.mean(inf_l); self.results[key]['trk'][trk] = np.mean(trk_l)
+
+            cap = cv2.VideoCapture(video_path)
+            for r in resolutions:
+                frames, t_start = 0, time.time()
+                reid_buffer = defaultdict(list); tracker = LowLevelTracker()
+                for _ in range(20):
+                    ret, frame = cap.read()
+                    if not ret: break
+                    frames += 1
+                    res = model.predict(frame, imgsz=r, device=dev, verbose=False)[0]
+                    boxes = [tuple(b.xyxy[0].cpu().numpy().astype(int)) for b in res.boxes]
+                    tracks = tracker.update(boxes, frame.shape[:2])
+                    if res.masks:
+                        for i, (tid, b) in enumerate(tracks.items()):
+                            if i < len(res.masks.data):
+                                reid_buffer[tid].append(get_color_histogram_method(frame, res.masks.data[i].cpu().numpy(), b))
+                
+                fps = frames / (time.time() - t_start + 1e-6)
+                self.results[key]['res']['imgsz'].append(r)
+                self.results[key]['res']['fps'].append(fps)
+                self.results[key]['res']['gflops'].append(12.0 * ((r/640)**2) * fps)
+                accs = [Counter(v).most_common(1)[0][1]/len(v) for v in reid_buffer.values() if len(v)>2]
+                self.results[key]['res']['reid'].append(np.mean(accs)*100 if accs else 0)
+                self.results[key]['res']['occ'].append(min(100, (frames / (tracker.next_id + 1e-6)) * 10))
+            cap.release()
+        self.app.show_report(self.results)
+
+
+class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vision Research Engine - Full Suite")
-        self.root.geometry("650x950")
-        self.root.configure(bg="#1a1a1a")
-        
-        self.video_path = tk.StringVar()
-        self.use_gpu = tk.BooleanVar(value=torch.cuda.is_available())
-        self.use_openvino = tk.BooleanVar(value=True)
-        self.current_results_dir = ""
+        self.root.title("Benchmark")
+        self.root.geometry("1400x900")
+        self.root.configure(bg="#121212")
+        self.bench = BenchmarkEngine(self)
+        self.video_path = None
         self.setup_ui()
 
     def setup_ui(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        main = ttk.Frame(self.root, padding=30)
-        main.pack(fill="both", expand=True)
+        l = tk.Frame(self.root, bg="#1e1e1e", width=250); l.pack(side="left", fill="y", padx=5, pady=5); l.pack_propagate(False)
+        tk.Label(l, text="BENCHMARK", bg="#1e1e1e", fg="#00ff00", font=("Arial", 12, "bold")).pack(pady=20)
+        tk.Button(l, text="📂 Load Video", command=self.load_video).pack(fill="x", padx=10)
+        self.btn = tk.Button(l, text="🚀 RUN SUITE", command=self.run_benchmark, state="disabled", bg="#d63031", fg="white")
+        self.btn.pack(fill="x", padx=10, pady=20)
+        self.st = tk.Label(l, text="Ready", bg="#1e1e1e", fg="gray"); self.st.pack(side="bottom", pady=20)
+        self.fig = Figure(figsize=(11, 8), dpi=100, facecolor="#121212")
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root); self.canvas.get_tk_widget().pack(side="right", fill="both", expand=True)
 
-        ttk.Label(main, text="SCIENTIFIC REPORT GENERATOR", font=("Helvetica", 18, "bold")).pack(pady=20)
+    def load_video(self):
+        self.video_path = filedialog.askopenfilename()
+        if self.video_path: self.btn.config(state="normal")
+
+    def update_status(self, t): self.st.config(text=t); self.root.update()
+
+    def run_benchmark(self):
+        self.btn.config(state="disabled")
+        threading.Thread(target=lambda: self.bench.run_suite(self.video_path), daemon=True).start()
+
+    def save_individual_plot(self, plot_func, filename, title, xlabel, ylabel):
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111)
+        plot_func(ax)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, linestyle='--', alpha=0.7)
+        fig.tight_layout()
+        fig.savefig(filename)
+        plt.close(fig)
+
+    def show_report(self, res):
+        self.fig.clf(); axs = self.fig.subplots(2, 3)
+        self.fig.subplots_adjust(hspace=0.4, wspace=0.3)
+        r_cpu = res['cpu']['res']
+        r_gpu = res['gpu']['res']
+
+        # 1. Latency 
+        def plot_latency(ax):
+            trks = list(res['cpu']['inf'].keys())
+            x = np.arange(len(trks))
+            inf_v = [res['cpu']['inf'].get(t,0) for t in trks]
+            trk_v = [res['cpu']['trk'].get(t,0) for t in trks]
+            ax.bar(x, inf_v, 0.4, label='Inference (AI)', color='#ff7675')
+            ax.bar(x, trk_v, 0.4, bottom=inf_v, label='Tracking (Math)', color='#74b9ff')
+            ax.set_xticks(x); ax.set_xticklabels(trks, rotation=15)
+            ax.legend()
         
-        file_frame = ttk.Frame(main)
-        file_frame.pack(fill="x", pady=10)
-        ttk.Entry(file_frame, textvariable=self.video_path).pack(side="left", fill="x", expand=True)
-        ttk.Button(file_frame, text="Browse", command=lambda: self.video_path.set(filedialog.askopenfilename())).pack(side="right", padx=5)
+        self.save_individual_plot(plot_latency, "report_latency.png", "Latency Breakdown", "Tracker Type", "Time (ms)")
+        plot_latency(axs[0,0]); axs[0,0].set_title("1. Latency Breakdown", color='white')
 
-        cfg = ttk.LabelFrame(main, text=" Hardware & optimization controls ", padding=15)
-        cfg.pack(fill="x", pady=20)
-        ttk.Checkbutton(cfg, text="Enable GPU acceleration", variable=self.use_gpu).pack(anchor="w", pady=5)
-        ttk.Checkbutton(cfg, text="Enable OpenVINO optimization", variable=self.use_openvino).pack(anchor="w", pady=5)
+        # 2. FPS Scaling
+        def plot_fps(ax):
+            ax.plot(r_cpu['imgsz'], r_cpu['fps'], 'o-', label='CPU FPS', color='#ff7675')
+            if r_gpu['fps']:
+                ax.plot(r_gpu['imgsz'], r_gpu['fps'], 's--', label='GPU FPS', color='#00cec9')
+            ax.legend()
 
-        self.run_btn = tk.Button(main, text="RUN COMPREHENSIVE STUDY", bg="#0984e3", fg="white", 
-                                font=("Helvetica", 12, "bold"), relief="flat", command=self.run_protocol)
-        self.run_btn.pack(fill="x", pady=30)
+        self.save_individual_plot(plot_fps, "report_fps.png", "FPS vs Resolution", "Image Size (px)", "Frames Per Second")
+        plot_fps(axs[0,1]); axs[0,1].set_title("2. FPS Scaling", color='white')
+
+        # 3. Re-ID Accuracy
+        def plot_reid(ax):
+            ax.plot(r_cpu['imgsz'], r_cpu['reid'], 'o-', label='CPU Re-ID', color='#fdcb6e')
+            if r_gpu['reid']:
+                ax.plot(r_gpu['imgsz'], r_gpu['reid'], 's--', label='GPU Re-ID', color='#e17055')
+            ax.legend()
+
+        self.save_individual_plot(plot_reid, "report_reid.png", "Re-ID Accuracy", "Image Size (px)", "Accuracy (%)")
+        plot_reid(axs[0,2]); axs[0,2].set_title("3. Re-ID Accuracy", color='white')
+
+        # 4. ID Stability
+        def plot_occ(ax):
+            ax.bar([str(i) for i in r_cpu['imgsz']], r_cpu['occ'], color='#a29bfe', alpha=0.7)
         
-        self.status = ttk.Label(main, text="Ready", foreground="#00b894")
-        self.status.pack()
+        self.save_individual_plot(plot_occ, "report_stability.png", "ID Stability Score", "Image Size (px)", "Stability Score")
+        plot_occ(axs[1,0]); axs[1,0].set_title("4. ID Stability", color='white')
 
-    def create_results_folder(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_results_dir = f"research_data_{timestamp}"
-        os.makedirs(self.current_results_dir, exist_ok=True)
+        # 5. Sweet Spot
+        def plot_sweet(ax):
+            q, s = np.array(r_cpu['reid']), np.array(r_cpu['fps'])
+            score = (q * s) / 100
+            ax.plot([str(i) for i in r_cpu['imgsz']], score, 'D-g', label='Perf Score')
+            ax.legend()
 
-    def run_protocol(self):
-        if not self.video_path.get(): return
-        self.run_btn.config(state="disabled", text="ACQUIRING DATA...")
-        self.root.update()
-        try:
-            self.create_results_folder()
-            df_main, df_abl, df_skip = self.execute_experiments()
-            self.generate_scientific_plots(df_main, df_abl, df_skip)
-            messagebox.showinfo("Success", f"All 8 figures generated in:\n{self.current_results_dir}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-        finally:
-            self.run_btn.config(state="normal", text="RUN COMPREHENSIVE STUDY")
+        self.save_individual_plot(plot_sweet, "report_sweetspot.png", "Quality/Speed Trade-off", "Image Size (px)", "Efficiency Score")
+        plot_sweet(axs[1,1]); axs[1,1].set_title("5. Sweet Spot", color='white')
 
-    def execute_experiments(self):
-        resolutions = [160, 320, 480, 640]
-        skip_rates = [0, 1, 2, 3]
-        video = self.video_path.get()
-        device = 0 if self.use_gpu.get() else 'cpu'
-        
-        # OpenVINO Export (Dynamic shapes fix)
-        base_m = YOLO("yolov8n-seg.pt")
-        if self.use_openvino.get():
-            base_m.export(format="openvino", dynamic=True, half=True)
-            model = YOLO("yolov8n-seg_openvino_model", task="segment")
-        else:
-            model = base_m
+        # 6. GFLOPS
+        def plot_gflops(ax):
+            if r_gpu['gflops']:
+                ax.bar([str(i) for i in r_gpu['imgsz']], r_gpu['gflops'], color='#00b894')
+            else:
+                ax.text(0.5, 0.5, "GPU N/A", ha='center')
 
-        main_data, ablation_data, skip_data = [], [], []
+        self.save_individual_plot(plot_gflops, "report_gflops.png", "GPU GFLOPS Load", "Image Size (px)", "GFLOPS")
+        plot_gflops(axs[1,2]); axs[1,2].set_title("6. GPU GFLOPS", color='white')
 
-        # Reference Ground Truth
-        cap = cv2.VideoCapture(video); ret, f = cap.read(); cap.release()
-        f_ref = cv2.resize(f, (640,360))
-        res_gt = model.predict(f_ref, imgsz=640, verbose=False)[0]
-        gt_color = "Unknown"
-        if res_gt.masks:
-            m_gt = res_gt.masks.data[0].cpu().numpy()
-            b_gt = res_gt.boxes.xyxy[0].cpu().numpy().astype(int)
-            gt_color, _ = get_color_histogram_method(f_ref, m_gt, b_gt)
+        for a in axs.flat: 
+            a.set_facecolor('#1e1e1e')
+            a.tick_params(colors='white')
+            a.xaxis.label.set_color('white')
+            a.yaxis.label.set_color('white')
 
-        # 1. Pipeline Analysis Sweep
-        for res in resolutions:
-            self.status.config(text=f"Testing {res}px...")
-            self.root.update()
-            cap = cv2.VideoCapture(video); my_tracker = LowLevelTracker(); f_idx = 0
-            while f_idx < 30:
-                ret, frame = cap.read()
-                if not ret: break
-                frame_p = cv2.resize(frame, (640, 360))
-                
-                # DETECTION STAGE
-                t0 = time.perf_counter()
-                p = model.predict(frame_p, imgsz=res, device=device, verbose=False)[0]
-                t_inf = (time.perf_counter() - t0) * 1000
-
-                # TRACKING STAGES (Comparison)
-                dets = [tuple(b.xyxy[0].cpu().numpy().astype(int)) for b in p.boxes if int(b.cls[0]) == 0]
-                t_s1 = time.perf_counter(); my_tracker.update(dets, (640, 360)); t_tr_my = (time.perf_counter()-t_s1)*1000
-                t_s2 = time.perf_counter(); model.track(frame_p, tracker="bytetrack.yaml", verbose=False, imgsz=res); t_tr_byte = (time.perf_counter()-t_s2)*1000
-                t_s3 = time.perf_counter(); model.track(frame_p, tracker="botsort.yaml", verbose=False, imgsz=res); t_tr_bot = (time.perf_counter()-t_s3)*1000
-                
-                # RE-ID & MORPHOLOGY
-                t_reid, t_e_my, t_e_cv = 0, 0, 0
-                if p.masks:
-                    m = p.masks.data[0].cpu().numpy()
-                    # Morphology
-                    te1 = time.perf_counter(); _ = numpy_erode(m, 1); t_e_my = (time.perf_counter()-te1)*1000
-                    te2 = time.perf_counter(); _ = cv2.erode(m, np.ones((3,3),np.uint8)); t_e_cv = (time.perf_counter()-te2)*1000
-                    # Re-ID logic
-                    tr_s = time.perf_counter(); cur_col, _ = get_color_histogram_method(frame_p, m, p.boxes.xyxy[0].cpu().numpy().astype(int)); t_reid = (time.perf_counter()-tr_s)*1000
-                    acc = 1.0 if cur_col == gt_color else 0.4
-
-                main_data.append({
-                    'imgsz': res, 'inf': t_inf, 'track_my': t_tr_my, 'track_byte': t_tr_byte, 'track_bot': t_tr_bot,
-                    'ero_my': t_e_my, 'ero_cv': t_e_cv, 'reid': t_reid, 'acc': acc, 'fps': 1000/(t_inf+t_tr_my+t_reid+1e-6)
-                })
-                f_idx += 1
-            cap.release()
-
-        # 2. Skip Frame Study
-        for skip in skip_rates:
-            self.status.config(text=f"Skip Frame Study: {skip}...")
-            self.root.update()
-            # Simulation of Re-ID stability drop
-            skip_data.append({'skip': skip, 'throughput': 30 * (skip + 1), 'consistency': 0.98 - (skip * 0.12)})
-
-        for i in range(6): ablation_data.append({'iter': i, 'stability': 0.95 - (i*0.04)})
-
-        return pd.DataFrame(main_data), pd.DataFrame(ablation_data), pd.DataFrame(skip_data)
-
-    def generate_scientific_plots(self, df, df_abl, df_skip):
-        plt.style.use('ggplot')
-        avg = df.groupby('imgsz').mean(numeric_only=True)
-        x = np.arange(len(avg))
-        width = 0.25
-
-        def save(name): plt.savefig(os.path.join(self.current_results_dir, name), dpi=300, bbox_inches='tight'); plt.close()
-
-        # 1. Comparative tracking overhead
-        plt.figure(figsize=(10, 6))
-        ax = plt.gca()
-        r1 = ax.bar(x - width, avg['track_my'], width, label='Proposed tracker (centroid)', color='#6c5ce7')
-        r2 = ax.bar(x, avg['track_byte'], width, label='Bytetrack overhead', color='#fab1a0')
-        r3 = ax.bar(x + width, avg['track_bot'], width, label='Botsort overhead', color='#b2bec3')
-        for r in [r1, r2, r3]:
-            for rect in r:
-                ax.annotate(f'{rect.get_height():.2f}', xy=(rect.get_x() + rect.get_width()/2, rect.get_height()), xytext=(0,3), textcoords="offset points", ha='center', fontsize=8)
-        plt.title("Comparative tracking computational overhead"); plt.xticks(x, avg.index); plt.ylabel("Latency [ms]"); plt.legend(); save("1_tracking_overhead.png")
-
-        # 2. Total end-to-end pipeline latency
-        plt.figure(figsize=(10, 6))
-        avg[['inf', 'track_my', 'reid']].plot(kind='bar', stacked=True, ax=plt.gca(), color=['#a29bfe', '#6c5ce7', '#fdcb6e'])
-        plt.title("Total end-to-end pipeline latency breakdown"); plt.ylabel("Time [ms]"); save("2_pipeline_breakdown.png")
-
-        # 3. Accuracy vs throughput trade-off
-        fig, ax1 = plt.subplots(figsize=(10, 6))
-        ax1.plot(avg.index, avg['fps'], 'g-o', label='System throughput (fps)')
-        ax2 = ax1.twinx(); ax2.plot(avg.index, avg['acc']*100, 'b-s', label='Re-id accuracy (%)')
-        plt.title("Accuracy vs throughput trade-off"); plt.legend(); save("3_tradeoff.png")
-
-        # 4. Morphology implementation efficiency
-        plt.figure(figsize=(10, 6))
-        plt.bar(x - 0.1, avg['ero_my'], 0.2, label='Custom numpy erode'); plt.bar(x + 0.1, avg['ero_cv'], 0.2, label='Native opencv erode')
-        plt.title("Morphology implementation efficiency"); plt.xticks(x, avg.index); plt.legend(); save("4_morphology.png")
-
-        # 5. Impact of frame skipping on consistency
-        plt.figure(figsize=(10, 6))
-        plt.plot(df_skip['skip'], df_skip['consistency']*100, 'r-X', linewidth=2)
-        plt.title("Impact of frame skipping on feature consistency"); plt.xlabel("Frames skipped"); plt.ylabel("Consistency [%]"); save("5_skip_consistency.png")
-
-        # 6. Throughput gain via skipping
-        plt.figure(figsize=(10, 6))
-        plt.bar(df_skip['skip'].astype(str), df_skip['throughput'], color='#55efc4')
-        plt.title("System throughput gain via frame skipping"); plt.ylabel("Effective fps"); save("6_skip_throughput.png")
-
-        # 7. Ablation study: mask refinement
-        plt.figure(figsize=(10, 6)); plt.plot(df_abl['iter'], df_abl['stability']*100, 'm-o')
-        plt.title("Ablation study: mask refinement stability"); plt.xlabel("Erosion iterations"); save("7_ablation.png")
-
-        # 8. Tracker robustness to occlusion
-        plt.figure(figsize=(10, 6)); plt.plot([0, 10, 20, 30, 40], [100, 95, 88, 45, 5], 'k--o')
-        plt.axvline(30, color='r', label='max_lost limit'); plt.title("Tracker robustness to occlusion duration"); plt.legend(); save("8_occlusion.png")
+        self.canvas.draw(); self.btn.config(state="normal"); self.update_status("Saved & Displayed.")
 
 if __name__ == "__main__":
-    root = tk.Tk(); app = ScientificResearchSuite(root); root.mainloop()
+    root = tk.Tk(); app = App(root); root.mainloop()

@@ -10,14 +10,45 @@ import time
 import psutil
 import torch
 import os
-from bench_tools import AnalyticsEngine 
 
 # Biblioteki do wykresów
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-# --- 1. TRACKER (Math only) ---
+
+class AnalyticsEngine:
+    def __init__(self):
+        self.data = []
+        self.start_t = 0
+
+    def reset_timer(self):
+        self.start_t = time.perf_counter()
+
+    def get_elapsed(self):
+        return (time.perf_counter() - self.start_t) * 1000  # Wynik w ms
+
+    def log_frame(self, frame_idx, res, is_ov, steps, fps, cpu, mem):
+        self.data.append({
+            'frame': frame_idx,
+            'res': res,
+            'openvino': is_ov,
+            'steps': steps, 
+            'fps': fps,
+            'cpu': cpu,
+            'mem': mem,
+            'device': 'GPU' if torch.cuda.is_available() else 'CPU'
+        })
+
+    def save_report(self):
+        import csv
+        if not self.data: return
+        with open("benchmark_results.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.data[0].keys())
+            writer.writeheader()
+            writer.writerows(self.data)
+
+# Tracker
 class LowLevelTracker:
     def __init__(self, max_lost=30, iou_thresh=0.3):
         self.max_lost = max_lost
@@ -152,50 +183,38 @@ class LowLevelTracker:
                     break
         return active_tracks_map, lost_ids, track_id_to_det_index
 
-# --- 2. ADVANCED COLOR LOGIC (PURE NUMPY) ---
-
 def numpy_erode(mask, iterations=1):
     if iterations <= 0: return mask
     
-    # Kopiujemy tylko raz na początku
     m = mask.astype(bool)
     
     for _ in range(iterations):
-        # Używamy logicznego AND bezpośrednio na wycinkach (slices)
-        # To nie tworzy nowych macierzy 'up', 'down' itd.
         m[1:-1, 1:-1] &= m[0:-2, 1:-1] # Góra
         m[1:-1, 1:-1] &= m[2:, 1:-1]   # Dół
         m[1:-1, 1:-1] &= m[1:-1, 0:-2] # Lewo
         m[1:-1, 1:-1] &= m[1:-1, 2:]   # Prawo
-        
-        # Brzegi maski zazwyczaj zerujemy, bo nie mają kompletu sąsiadów
+
         m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = False
         
     return m.astype(np.uint8)
 
 def get_color_histogram_method(img, mask, box):
-    # NAPRAWA: Rzutowanie współrzędnych na int, aby uniknąć błędu 'slice indices must be integers'
     x1, y1, x2, y2 = map(int, box) 
     h, w = img.shape[:2]
     
-    # Clip coordinates do granic obrazu
     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
     
     roi_img = img[y1:y2, x1:x2]
     roi_h, roi_w = roi_img.shape[:2]
     if roi_h < 5 or roi_w < 5: return None, None
     
-    # Resize maski do rozmiaru ROI
     mask_resized = cv2.resize(mask, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
     mask_bin = (mask_resized > 0.5).astype(np.uint8)
 
-    # OPTYMALIZACJA: Dynamiczna liczba iteracji erozji zależna od wielkości obiektu
-    # Poprawia stabilność wyników Re-ID (Ablation Study)
     mask_area = np.sum(mask_bin)
     iterations = max(1, int(mask_area / 5000)) if roi_w > 40 else 0
     mask_eroded = numpy_erode(mask_bin, iterations=iterations)
 
-    # Center Crop dla analizy głównego koloru (np. tułowia)
     center_y, center_x = int(roi_h * 0.35), int(roi_w * 0.5)
     crop_h, crop_w = int(roi_h * 0.25), int(roi_w * 0.60) 
     
@@ -207,21 +226,18 @@ def get_color_histogram_method(img, mask, box):
 
     valid_pixels = img_crop[mask_crop > 0]
     
-    # Fallback jeśli erozja była zbyt silna
     if len(valid_pixels) < 10:
         mask_crop = mask_bin[y_start:y_end, x_start:x_end]
         valid_pixels = img_crop[mask_crop > 0]
         
     if len(valid_pixels) < 10: return "Unknown", None 
 
-    # Analiza HSV
     valid_pixels_2d = valid_pixels.reshape(-1, 1, 3)
     hsv_pixels = cv2.cvtColor(valid_pixels_2d, cv2.COLOR_BGR2HSV)
     
     H, S, V = hsv_pixels[:,:,0].flatten(), hsv_pixels[:,:,1].flatten(), hsv_pixels[:,:,2].flatten()
     scores = defaultdict(int)
     
-    # Logika progowania kolorów
     is_black = (V < 35) 
     scores['Black'] = np.sum(is_black)
     is_white = (V > 200) & (S < 40)
@@ -244,19 +260,13 @@ def get_color_histogram_method(img, mask, box):
     
     return best_color, (x_start, y_start, x_end-x_start, y_end-y_start)
 
-# --- 3. GUI APPLICATION ---
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("People Analytics - Ultimate")
+        self.root.title("People Tracker")
         self.root.geometry("1200x950")
         self.root.config(bg="#121212")
-
-        try:
-            self.bench = AnalyticsEngine()
-            print(">>> DEBUG: AnalyticsEngine zainicjalizowany poprawnie")
-        except Exception as e:
-            print(f">>> DEBUG ERROR: Nie udało się stworzyć AnalyticsEngine: {e}")
+        self.bench = AnalyticsEngine()
 
         style = ttk.Style()
         style.theme_use('clam')
@@ -313,22 +323,20 @@ class App:
         self.setup_ui()
         self.reload_model_based_on_mode()
 
+
     def setup_ui(self):
         main_frame = tk.Frame(self.root, bg="#121212")
         main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Video
         self.vid_frame = tk.Frame(main_frame, bg="black", bd=2, relief="sunken")
         self.vid_frame.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=5)
         self.lbl_vid = tk.Label(self.vid_frame, bg="black", text="Load Video to Start", fg="gray")
         self.lbl_vid.pack(expand=True, fill="both")
 
-        # Side Panel
         side_panel = tk.Frame(main_frame, bg="#1e1e1e", width=320)
         side_panel.grid(row=0, column=1, sticky="ns", padx=5)
         side_panel.pack_propagate(False)
 
-        # === A. CONTROL PANEL ===
         ctrl_header = tk.Frame(side_panel, bg="#1e1e1e")
         ctrl_header.pack(fill="x", padx=10, pady=(10,5))
         self.btn_toggle_ctrl = tk.Button(ctrl_header, text="▼", font=("Consolas", 10), bg="#1e1e1e", fg="white", bd=0, command=self.toggle_control_panel, cursor="hand2")
@@ -362,7 +370,6 @@ class App:
         ttk.Radiobutton(mode_frame, text="Standard (Fast, Box Only)", value="box", variable=self.var_mode, command=self.on_mode_change).pack(anchor="w")
         ttk.Radiobutton(mode_frame, text="Segmentation (Color, Slow)", value="seg", variable=self.var_mode, command=self.on_mode_change).pack(anchor="w")
 
-        # === B. Basic Stats ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         self.stats_container = tk.Frame(side_panel, bg="#2d2d2d", padx=10, pady=10)
         self.stats_container.pack(fill="x", padx=10)
@@ -370,7 +377,6 @@ class App:
         self.lbl_count.pack()
         tk.Label(self.stats_container, text="People Passed", bg="#2d2d2d", fg="#aaaaaa", font=("Segoe UI", 9)).pack()
 
-        # === C. Extended Stats ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         ext_header = tk.Frame(side_panel, bg="#1e1e1e")
         ext_header.pack(fill="x", padx=10, pady=5)
@@ -387,7 +393,6 @@ class App:
         self.lbl_colors = tk.Label(self.ext_content_frame, text="-", bg="#252525", fg="white", font=("Consolas", 9), justify="left")
         self.lbl_colors.pack(anchor="w")
 
-        # === D. Settings ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         perf_header_frame = tk.Frame(side_panel, bg="#1e1e1e")
         perf_header_frame.pack(fill="x", padx=10, pady=5)
@@ -404,7 +409,6 @@ class App:
                                    bg="#1e1e1e", fg="white", highlightthickness=0, command=self.update_params)
         self.scale_skip.pack(fill="x", padx=10, pady=(10,0))
         
-        # === E. System Monitor ===
         ttk.Separator(side_panel, orient='horizontal').pack(fill='x', pady=10)
         sys_header = tk.Frame(side_panel, bg="#1e1e1e")
         sys_header.pack(fill="x", padx=10, pady=5)
@@ -422,7 +426,6 @@ class App:
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(0, weight=1)
 
-    # --- TOGGLES ---
     def toggle_control_panel(self):
         if self.control_visible:
             self.control_content_frame.pack_forget()
@@ -463,7 +466,6 @@ class App:
             self.btn_toggle_sys.config(text="▼")
             self.sys_stats_visible = True
 
-    # --- LOGIC ---
     def reload_model_based_on_mode(self):
         mode = self.var_mode.get()
         try:
@@ -545,7 +547,6 @@ class App:
 
     def stop(self): 
         self.play = False
-        self.bench.save_report() # Zapisz CSV
         self.root.after(500, self.show_fps_chart)
     
     def show_fps_chart(self):
@@ -627,7 +628,6 @@ class App:
                 time.sleep(0.1)
                 continue
 
-            # --- START PROFILOWANIA KLATKI ---
             self.bench.reset_timer()
             t_frame_start = time.time()
             
@@ -657,13 +657,11 @@ class App:
             if should_detect:
                 # 3. Inferencja YOLO
                 self.bench.reset_timer()
-                # imgsz przekazywany dynamicznie naprawia błędy OpenVINO
                 results = self.model.predict(process_frame, verbose=False, imgsz=self.current_imgsz, device=self.device)[0]
                 steps['inference'] = self.bench.get_elapsed()
                 
                 # 4. Logika Trackera
                 self.bench.reset_timer()
-                # Rzutowanie na int zapobiega błędom indeksowania macierzy
                 dets = [tuple(b.xyxy[0].cpu().numpy().astype(int)) for b in results.boxes if int(b.cls[0]) == 0]
                 if is_seg_mode and results.masks is not None:
                     masks = results.masks.data.cpu().numpy() 
@@ -674,7 +672,6 @@ class App:
             else:
                 tracks = self.tracker.get_interpolated_tracks()
 
-            # Czyszczenie metadanych dla utraconych obiektów
             for tid in lost_ids:
                 if tid in self.track_metadata:
                     meta = self.track_metadata[tid]
@@ -686,17 +683,14 @@ class App:
                         })
                     del self.track_metadata[tid]
 
-            # Definicja strefy liczenia
             rx, ry, rw, rh = self.zone_rel
             zx1, zx2 = int((rx)*w), int((rx+rw)*w)
 
-            # --- GŁÓWNA PĘTLA ANALIZY I WIZUALIZACJI ---
             for tid, box in tracks.items():
                 if tid not in self.track_metadata:
                     self.track_metadata[tid] = {'zone_duration': 0.0, 'zone_speeds': [], 'final_color': None}
                 
                 meta = self.track_metadata[tid]
-                # Współrzędne całkowite do obliczeń i rysowania
                 bx1, by1, bx2, by2 = map(int, box)
                 cx = (bx1 + bx2) // 2
                 inside = zx1 <= cx <= zx2
@@ -712,7 +706,6 @@ class App:
                             self.seen_ids.add(tid)
                             self.passed += 1
 
-                # 5. KROK RE-ID (Analiza koloru na surowych pikselach)
                 if is_seg_mode and should_detect:
                     is_color_missing = (meta.get('final_color') in [None, "Unknown"])
                     if is_color_missing and (masks is not None) and (tid in id_to_det_idx):
@@ -721,7 +714,6 @@ class App:
                         if det_idx < len(masks):
                             person_mask = masks[det_idx]
                             
-                            # Pobranie koloru ZANIM narysujemy ramki na process_frame
                             raw_color, _ = get_color_histogram_method(process_frame, person_mask, (bx1, by1, bx2, by2))
                             
                             steps['reid'] = steps.get('reid', 0) + self.bench.get_elapsed()
@@ -729,11 +721,9 @@ class App:
                             if raw_color:
                                 meta['final_color'] = raw_color
 
-                # 6. WIZUALIZACJA (Dopiero teraz rysujemy po obrazie)
                 col = (0, 255, 0) if inside else (0, 0, 255)
                 thick = 2 if should_detect else 1
                 
-                # Rysowanie ramki
                 cv2.rectangle(process_frame, (bx1, by1), (bx2, by2), col, thick)
                 
                 label = f"ID:{tid}"
@@ -743,10 +733,8 @@ class App:
                 cv2.putText(process_frame, label, (bx1, by1 - 5), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, thick)
 
-            # Rysowanie linii strefy
             cv2.rectangle(process_frame, (zx1, 0), (zx2, h), (255, 200, 0), 2)
 
-            # --- STATYSTYKI I WYŚWIETLANIE ---
             t_frame_end = time.time()
             fps_real = 1.0 / (t_frame_end - t_frame_start + 1e-6)
             current_duration = t_frame_end - self.start_time_ref
@@ -756,14 +744,12 @@ class App:
 
             mem = self.process.memory_info().rss / 1024**2
             cpu = psutil.cpu_percent()
-            # Logowanie danych do AnalyticsEngine (potrzebne do raportu 1 i 2)
             self.bench.log_frame(frame_idx, self.current_imgsz, self.is_openvino, steps, fps_real, cpu, mem)
 
             if frame_idx % 5 == 0:
                 self.root.after(0, self.update_ui_stats)
                 self.root.after(0, self.update_perf_ui, fps_real, mem)
 
-            # Konwersja obrazu do Tkinter
             img_rgb = cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB)
             img_tk = ImageTk.PhotoImage(Image.fromarray(img_rgb))
             
@@ -774,7 +760,6 @@ class App:
             self.root.after(0, upd)
             
             frame_idx += 1
-            # Synchronizacja FPS
             elapsed = time.time() - t_frame_start
             wait = frame_dur - elapsed
             if wait > 0: time.sleep(wait)
